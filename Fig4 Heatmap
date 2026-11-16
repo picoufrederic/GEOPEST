@@ -1,0 +1,213 @@
+rm(list=ls())
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(purrr)
+library(tidyr)
+library(pheatmap)
+library(ggrepel)
+
+#######ici
+rm(list=ls())
+alpha<-"controle"
+
+#Travail sur les données
+res<-read.csv2("C:/Users/picou/Desktop/Amelie 2025 GEOAML/04032025/RD.csv")
+res<-cbind(res[,1], res[,c(6:8)], res[,c(16:63)])
+resmal<-subset(res, res[,1]==alpha)
+cols_triees<-sort(names(resmal[5:52]))
+df<-resmal<-resmal[,c(names(resmal[1:4]), cols_triees)]
+write.csv( colnames(resmal), "C:/Users/picou/Desktop/Amelie 2025 GEOAML/04032025/Figure controle/nom variables ordonnees.csv")
+
+
+#format long
+df_long<-resmal%>%
+  mutate(row_id = row_number()) %>%
+  pivot_longer(
+    cols=5:52,
+    names_to = "variable",
+    values_to = "group"
+  )
+
+
+##POUR IFT
+results <- df_long %>%
+  mutate(y = df_long[[2]]) %>%
+  filter(!is.na(group), !is.na(y)) %>%
+  group_by(variable) %>%
+  summarise(
+    mean_oui = mean(y[group == "oui"], na.rm = TRUE),
+    mean_non = mean(y[group == "non"], na.rm = TRUE),
+    FC = mean_oui / mean_non,
+    log2FC = log2(FC),
+    p_value = ifelse(
+      length(unique(group)) < 2 |
+        any(table(group) < 2),
+      NA,
+      t.test(y ~ group)$p.value
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_adj = p.adjust(p_value, method = "none"),
+    minus_log10_p = -log10(p_value),
+    significant=p_adj < 0.05
+    
+  )
+resIFT<-cbind(results$variable, results$FC, results$p_value)
+
+##POUR IFT non herb
+results <- df_long %>%
+  mutate(y = df_long[[3]]) %>%
+  filter(!is.na(group), !is.na(y)) %>%
+  group_by(variable) %>%
+  summarise(
+    mean_oui = mean(y[group == "oui"], na.rm = TRUE),
+    mean_non = mean(y[group == "non"], na.rm = TRUE),
+    FC = mean_oui / mean_non,
+    log2FC = log2(FC),
+    p_value = ifelse(
+      length(unique(group)) < 2 |
+        any(table(group) < 2),
+      NA,
+      t.test(y ~ group)$p.value
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_adj = p.adjust(p_value, method = "none"),
+    minus_log10_p = -log10(p_value),
+    significant=p_adj < 0.05
+  )
+resIFTnh<-cbind(results$variable, results$FC, results$p_value)
+
+##POUR IFT herb
+results <- df_long %>%
+  mutate(y = df_long[[4]]) %>%
+  filter(!is.na(group), !is.na(y)) %>%
+  group_by(variable) %>%
+  summarise(
+    mean_oui = mean(y[group == "oui"], na.rm = TRUE),
+    mean_non = mean(y[group == "non"], na.rm = TRUE),
+    FC = mean_oui / mean_non,
+    log2FC = log2(FC),
+    p_value = ifelse(
+      length(unique(group)) < 2 |
+        any(table(group) < 2),
+      NA,
+      t.test(y ~ group)$p.value
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_adj = p.adjust(p_value, method = "none"),
+    minus_log10_p = -log10(p_value),
+    significant=p_adj < 0.05
+  )
+resIFTh<-cbind(results$variable, results$FC, results$p_value)
+
+res2<-cbind(resIFT, resIFTnh[,2:3], resIFTh[,2:3])
+
+#heatmap
+resheatmap<-res2[,c(3,5,7)]
+resheatmap<-apply(resheatmap, 2, as.numeric)
+resheatmap<--log10(resheatmap)
+
+rownames(resheatmap)<-res2[,1]
+
+
+pheatmap(
+  resheatmap,
+  breaks =seq(0,2, length.out=101),
+  color = colorRampPalette(c("white","orange","red"))(100),
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  show_rownames=TRUE,
+  show_colnames=TRUE,
+  main = "-log10(p-value) Wilcoxon (FDR)"
+)
+ rm(resheatmap)
+
+#Volcano plot
+resvolc<-res2[,c(2,3,4,5,6,7)]
+
+resvolc<-apply(resvolc, 2, as.numeric)
+resvolc[is.na(resvolcano)]<-0
+resvolc <- as.data.frame(resvolc)
+rownames(resvolc)<-res2[,1]
+
+p<-ggplot(resvolc, aes(x = resvolc[,2], y = -log10(resvolc[,3]))) +
+  geom_point(color = "steelblue", alpha = 0.6) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") + # seuil p = 0.05
+  theme_minimal() +
+  labs(
+    x = "Fold Change",
+    y = "-log10(p-value)"
+  )     +
+  coord_cartesian(xlim = c(-1.5, 1.5), ylim = c(0, 2))
+ggsave("volcano_plotIFT.pdf", plot = p, width = 8, height = 6)
+
+p<-ggplot(resvolc, aes(x = resvolc[,3], y = -log10(resvolc[,4]))) +
+  geom_point(color = "steelblue", alpha = 0.6) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") + # seuil p = 0.05
+  theme_minimal() +
+  labs(
+    x = "Fold Change",
+    y = "-log10(p-value)"
+  )     +
+  coord_cartesian(xlim = c(-1.5, 1.5), ylim = c(0, 2))
+ggsave("volcano_plotnhIFT.pdf", plot = p, width = 8, height = 6)
+
+p<-ggplot(resvolc, aes(x = resvolc[,5], y = -log10(resvolc[,6]))) +
+  geom_point(color = "steelblue", alpha = 0.6) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") + # seuil p = 0.05
+  theme_minimal() +
+  labs(
+    x = "Fold Change",
+    y = "-log10(p-value)"
+  )     +
+  coord_cartesian(xlim = c(-1.5, 1.5), ylim = c(0, 2))
+ggsave("volcano_plothIFT.pdf", plot = p, width = 8, height = 6)
+
+
+
+
+
+###heatmap des fréquence
+
+res2<-res %>%
+  mutate(quartile = ntile(IFT.total, 4)) 
+cols_triees<-sort(names(res2[5:52]))
+res3<-res2[,c(names(res2[1:4]), cols_triees)]
+res3<-cbind(res3, res2[,53])
+res3<-(subset(res3, res3[,1]==alpha))
+res3<-res3[,c(5:53)]
+
+prop_tab<-sapply(res3[,1:48], function (g) {
+  tapply(g== "oui", res3[,49], mean)})
+
+prop_tab<-t(prop_tab)
+colnames(prop_tab)<-paste0("Q",1:4)
+
+proptabgroup<-data.frame(
+  "Q1_Q2"=rowMeans(prop_tab[,c(1:2)]),
+  "Q3_Q4"=rowMeans(prop_tab[,c(3:4)])
+)
+count_tab<-sapply(res3[,1:48], function (g) {
+  tapply(g== "oui", res3[,49], sum)})
+count<-rbind(count_tab[1,]+count_tab[2,], count_tab[3,]+count_tab[4,])
+
+
+pheatmap(
+  proptabgroup,
+  breaks =seq(0,1, length.out=101),
+  color = colorRampPalette(c("white","blue"))(30),
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  show_rownames=TRUE,
+  show_colnames=TRUE,
+  main = "",
+  display_numbers = t(count)
+)
+
+write.csv( count_tab, "C:/Users/picou/Desktop/Amelie 2025 GEOAML/04032025/Figure controle/count.csv")
