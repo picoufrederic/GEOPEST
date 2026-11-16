@@ -1,0 +1,634 @@
+###########################################################
+# SCRIPT COMPLET "TOUT-EN-UN"
+# 1) CONSTRUIT automatiquement un fichier POPULATION joignable
+#    (population_commune_cp.csv : code_postal, code_insee, commune_nom, population)
+# 2) CALCULE ensuite l'incidence annuelle LAM (/100k) par CP/commune
+#    en comparant expo : Q1_Q2 vs Q3_Q4
+#    (quartiles calculés sur ift_total)
+#
+# Sorties dans un dossier horodaté :
+# - population_commune_cp.csv
+# - table_incidence_LAM_par_commune.csv (long : expo_grp = Q1_Q2 / Q3_Q4)
+# - comparaison_Q1Q2_vs_Q3Q4_par_commune.csv (wide + IRR)
+# - QC_resume.csv
+# - QC_top30_incidence_annuelle.csv
+# - figure_Q1Q2_vs_Q3Q4.png
+############################################################
+
+
+# =========================
+# 0) Packages
+# =========================
+pkgs <- c("readr","readxl","dplyr","stringr","janitor","tools","lubridate","tidyr","tibble","utils","ggplot2")
+to_install <- setdiff(pkgs, rownames(installed.packages()))
+if (length(to_install)) install.packages(to_install, dependencies = TRUE)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+
+# =========================
+# 1) Helpers généraux
+# =========================
+read_any <- function(path){
+  ext <- tolower(tools::file_ext(path))
+  if (ext %in% c("xls","xlsx")) {
+    return(readxl::read_excel(path) |> janitor::clean_names())
+  } else if (ext %in% c("csv")) {
+    return(suppressWarnings(readr::read_csv(path, show_col_types = FALSE, guess_max = 1e5)) |> janitor::clean_names())
+  } else if (ext %in% c("tsv","txt")) {
+    return(suppressWarnings(readr::read_delim(path, delim = "\t", show_col_types = FALSE, guess_max = 1e5)) |> janitor::clean_names())
+  } else stop("❌ Format non supporté: ", ext)
+}
+
+
+norm_key <- function(x){
+  z <- iconv(x, to = "ASCII//TRANSLIT")
+  z <- tolower(gsub("[^a-z0-9]+", "", z))
+  z
+}
+
+
+find_column <- function(df_names, targets){
+  nn <- norm_key(df_names)
+  tt <- norm_key(targets)
+  
+  hit <- which(nn %in% tt)
+  if (length(hit)) return(df_names[hit[1]])
+  
+  pattern <- paste(tt, collapse="|")
+  hit2 <- which(grepl(pattern, nn))
+  if (length(hit2)) return(df_names[hit2[1]])
+  
+  NA_character_
+}
+
+
+to_num <- function(x){
+  if (is.numeric(x)) return(x)
+  s <- as.character(x)
+  s <- gsub("\u00A0", "", s)
+  s <- gsub("\u202F", "", s)
+  s <- gsub("[[:space:]]+", "", s)
+  s <- gsub("'", "", s)
+  s <- gsub(",", ".", s)
+  s <- gsub("[^0-9.\\-]+", "", s)
+  suppressWarnings(as.numeric(s))
+}
+
+
+to_year <- function(x){
+  if (is.numeric(x)) {
+    if (all(is.na(x) | (x >= 1900 & x <= 2100))) return(as.integer(x))
+    dd <- suppressWarnings(as.Date(x, origin = "1899-12-30"))
+    return(suppressWarnings(as.integer(lubridate::year(dd))))
+  }
+  s <- stringr::str_squish(as.character(x))
+  yy1 <- suppressWarnings(as.integer(s))
+  ok1 <- !is.na(yy1) & yy1 >= 1900 & yy1 <= 2100
+  if (any(ok1)) {
+    out <- rep(NA_integer_, length(s))
+    out[ok1] <- yy1[ok1]
+    rest <- which(!ok1)
+    if (length(rest)) {
+      dd <- suppressWarnings(lubridate::dmy(s[rest]))
+      if (all(is.na(dd))) dd <- suppressWarnings(lubridate::ymd(s[rest]))
+      out[rest] <- suppressWarnings(as.integer(lubridate::year(dd)))
+    }
+    return(out)
+  }
+  dd <- suppressWarnings(lubridate::dmy(s))
+  if (all(is.na(dd))) dd <- suppressWarnings(lubridate::ymd(s))
+  suppressWarnings(as.integer(lubridate::year(dd)))
+}
+
+
+pad_cp <- function(x){
+  x <- stringr::str_squish(as.character(x))
+  x <- gsub("\\.0$", "", x)
+  x <- gsub("[^0-9]", "", x)
+  ifelse(is.na(x) | x=="", NA_character_, stringr::str_pad(x, 5, pad="0"))
+}
+
+
+# =========================
+# 2) Helpers : construire la POPULATION joignable
+# =========================
+find_col <- function(nms, targets){
+  nn <- tolower(gsub("[^a-z0-9]+","", nms))
+  tt <- tolower(gsub("[^a-z0-9]+","", targets))
+  
+  hit <- which(nn %in% tt)
+  if (length(hit)) return(nms[hit[1]])
+  
+  pat <- paste(tt, collapse="|")
+  hit2 <- which(grepl(pat, nn))
+  if (length(hit2)) return(nms[hit2[1]])
+  
+  NA_character_
+}
+
+
+read_insee_csv_robust <- function(path){
+  x1 <- try(suppressWarnings(readr::read_csv(path, show_col_types = FALSE)), silent = TRUE)
+  if (!inherits(x1, "try-error") && ncol(x1) > 1) return(janitor::clean_names(x1))
+  
+  x2 <- try(suppressWarnings(readr::read_delim(
+    path, delim = ";", show_col_types = FALSE, locale = locale(decimal_mark = ",")
+  )), silent = TRUE)
+  if (!inherits(x2, "try-error") && ncol(x2) > 1) return(janitor::clean_names(x2))
+  
+  x3 <- try(suppressWarnings(readr::read_delim(path, delim = "\t", show_col_types = FALSE)), silent = TRUE)
+  if (!inherits(x3, "try-error") && ncol(x3) > 1) return(janitor::clean_names(x3))
+  
+  stop("❌ Impossible de lire correctement le CSV INSEE.")
+}
+
+
+build_population_commune_cp <- function(out_dir){
+  dir.create(file.path(out_dir, "POP_BUILD_TMP"), showWarnings = FALSE, recursive = TRUE)
+  tmp_dir <- file.path(out_dir, "POP_BUILD_TMP")
+  
+  insee_zip_url <- "https://www.insee.fr/fr/statistiques/fichier/8680726/ensemble.zip"
+  cp_csv_url    <- "https://www.data.gouv.fr/api/1/datasets/r/008a2dda-2c60-4b63-b910-998f6f818089"
+  
+  insee_zip <- file.path(tmp_dir, "insee_pop_ensemble.zip")
+  cp_csv    <- file.path(tmp_dir, "base_officielle_codes_postaux.csv")
+  out_pop   <- file.path(out_dir, "population_commune_cp.csv")
+  
+  # --- INSEE ---
+  message("⬇️ [POP] Téléchargement INSEE ensemble.zip…")
+  utils::download.file(insee_zip_url, destfile = insee_zip, mode = "wb", quiet = TRUE)
+  message("📦 [POP] Extraction INSEE…")
+  insee_files <- utils::unzip(insee_zip, exdir = tmp_dir)
+  
+  csv_candidates <- insee_files[grepl("\\.csv$", insee_files, ignore.case = TRUE)]
+  if (length(csv_candidates) == 0) stop("❌ [POP] Aucun CSV trouvé dans le ZIP INSEE.")
+  
+  prefer <- csv_candidates[grepl("commune|communes", basename(csv_candidates), ignore.case = TRUE)]
+  csv_main <- if (length(prefer) > 0) prefer[which.max(file.info(prefer)$size)] else csv_candidates[which.max(file.info(csv_candidates)$size)]
+  
+  message("📄 [POP] Lecture INSEE : ", basename(csv_main))
+  insee_raw <- read_insee_csv_robust(csv_main)
+  
+  nms <- names(insee_raw)
+  col_insee <- find_col(nms, c("codgeo","depcom","codecommune","code_commune","code_insee","insee","com"))
+  col_lib   <- find_col(nms, c("libgeo","nom_commune","commune","libelle","nom"))
+  col_pmun  <- find_col(nms, c("pmun","popmun","population_municipale","pop_mun"))
+  col_ptot  <- find_col(nms, c("ptot","poptot","population_totale","pop_tot"))
+  col_pop_simple <- find_col(nms, c("population","pop"))
+  
+  if (is.na(col_insee)) stop("❌ [POP] INSEE: colonne code commune (CODGEO) non détectée.")
+  pop_col <- dplyr::coalesce(col_pmun, col_ptot, col_pop_simple)
+  if (is.na(pop_col)) stop("❌ [POP] INSEE: colonne population non détectée (PMUN/PTOT/POP).")
+  
+  message("✅ [POP] INSEE: code=", col_insee, " ; nom=", ifelse(is.na(col_lib), "NA", col_lib), " ; pop=", pop_col)
+  
+  insee_communes <- insee_raw |>
+    mutate(
+      code_insee  = stringr::str_pad(toupper(stringr::str_squish(as.character(.data[[col_insee]]))), 5, pad="0"),
+      commune_nom = if (!is.na(col_lib)) stringr::str_squish(stringr::str_to_upper(as.character(.data[[col_lib]]))) else NA_character_,
+      population  = suppressWarnings(as.numeric(.data[[pop_col]]))
+    ) |>
+    filter(!is.na(code_insee), code_insee != "",
+           !is.na(population), population > 0) |>
+    select(code_insee, commune_nom, population) |>
+    distinct()
+  
+  if (nrow(insee_communes) == 0) stop("❌ [POP] INSEE: 0 lignes communes après filtrage.")
+  message("🏙️ [POP] Communes INSEE retenues : ", nrow(insee_communes))
+  
+  # --- CP La Poste ---
+  message("⬇️ [POP] Téléchargement Base officielle des codes postaux…")
+  utils::download.file(cp_csv_url, destfile = cp_csv, mode = "wb", quiet = TRUE)
+  
+  message("📄 [POP] Lecture CP↔INSEE (delim=';')…")
+  cp_raw <- suppressWarnings(
+    readr::read_delim(
+      cp_csv,
+      delim = ";",
+      show_col_types = FALSE,
+      locale = readr::locale(encoding = "ISO-8859-1")
+    )
+  ) |> janitor::clean_names()
+  
+  n2 <- names(cp_raw)
+  cp_insee_col <- find_col(n2, c("code_commune_insee","codeinsee","insee","codgeo","depcom","com"))
+  cp_cp_col    <- find_col(n2, c("code_postal","cp","postal_code"))
+  cp_nom_col   <- find_col(n2, c("nom_commune","commune","libelle_acheminement","nom"))
+  
+  if (is.na(cp_insee_col) || is.na(cp_cp_col)) {
+    message("📌 [POP] Colonnes CP (aperçu) :"); print(head(names(cp_raw), 60))
+    stop("❌ [POP] CP: impossible de trouver (code_insee + code_postal).")
+  }
+  
+  cp_map <- cp_raw |>
+    mutate(
+      code_insee  = stringr::str_pad(toupper(stringr::str_squish(as.character(.data[[cp_insee_col]]))), 5, pad="0"),
+      code_postal = stringr::str_pad(gsub("[^0-9]","", as.character(.data[[cp_cp_col]])), 5, pad="0"),
+      commune_nom_cp = if (!is.na(cp_nom_col)) stringr::str_squish(stringr::str_to_upper(as.character(.data[[cp_nom_col]]))) else NA_character_
+    ) |>
+    filter(!is.na(code_insee), code_insee != "",
+           !is.na(code_postal), code_postal != "") |>
+    select(code_postal, code_insee, commune_nom_cp) |>
+    distinct()
+  
+  message("📮 [POP] Paires CP–INSEE : ", nrow(cp_map))
+  
+  pop_commune_cp <- cp_map |>
+    left_join(insee_communes, by = "code_insee") |>
+    mutate(commune_nom = dplyr::coalesce(commune_nom, commune_nom_cp)) |>
+    select(code_postal, code_insee, commune_nom, population) |>
+    filter(!is.na(population), population > 0)
+  
+  message("✅ [POP] Lignes finales avec population : ", nrow(pop_commune_cp))
+  if (nrow(pop_commune_cp) == 0) {
+    stop("❌ [POP] Fusion CP–INSEE vs INSEE population -> 0 ligne. Vérifie les codes INSEE.")
+  }
+  
+  readr::write_csv(pop_commune_cp, out_pop)
+  message("✅ [POP] Fichier population créé : ", out_pop)
+  out_pop
+}
+
+
+# =========================
+# 3) Sélection cohorte + sortie
+# =========================
+message("👉 Sélectionne le fichier COHORTE (CSV/Excel/TSV)")
+coh_path <- file.choose()
+
+
+message("👉 Choisis un dossier de sortie")
+out_dir <- {
+  out <- NA_character_
+  if (requireNamespace("rstudioapi", quietly = TRUE)) {
+    try(out <- rstudioapi::selectDirectory("Choisir le dossier de sortie"), silent = TRUE)
+  }
+  if ((is.na(out) || out == "") && requireNamespace("tcltk", quietly = TRUE)) {
+    try(out <- as.character(tcltk::tk_choose.dir(title = "Choisir le dossier de sortie")), silent = TRUE)
+  }
+  if (is.na(out) || out == "") out <- getwd()
+  out
+}
+message("📁 Sortie : ", out_dir)
+
+
+res_dir <- file.path(out_dir, paste0("ANALYSE_LAM_Q1Q2vsQ3Q4_", format(Sys.time(), "%Y%m%d_%H%M%S")))
+dir.create(res_dir, recursive = TRUE, showWarnings = FALSE)
+
+
+# =========================
+# 4) Construire la population joignable
+# =========================
+pop_path <- build_population_commune_cp(res_dir)
+
+
+# =========================
+# 5) Lecture cohorte + population
+# =========================
+coh_raw <- read_any(coh_path)
+pop_raw <- read_any(pop_path)
+
+
+message("\n📌 Colonnes COHORTE :"); print(names(coh_raw))
+message("\n📌 Colonnes POPULATION :"); print(names(pop_raw))
+
+
+# =========================
+# 6) Détection colonnes cohorte
+# =========================
+cnc <- names(coh_raw)
+col_statut <- find_column(cnc, c("statut","groupe","case_control","cas_temoin"))
+col_cp     <- find_column(cnc, c("code_postal","cp","postal_code","codepostal"))
+col_com    <- find_column(cnc, c("commune","ville","nom_commune","libelle"))
+col_year   <- find_column(cnc, c("annee_diagnostic","annee_diag","year_diag","date_diag","date_diagnostic","date_du_diagnostic","diagnostic_date"))
+col_patho  <- find_column(cnc, c("pathologie","diagnostic","maladie"))
+col_amltyp <- find_column(cnc, c("aml_type","type_aml","amltype"))
+col_ift    <- find_column(cnc, c("ift_total","ift","iftglobal","ift_tot","ift_total_commune","ift_hors_herbicide","ift_herbicide"))
+
+
+if (is.na(col_cp))  stop("❌ Cohorte: je ne trouve pas la colonne code_postal.")
+if (is.na(col_ift)) stop("❌ Cohorte: je ne trouve pas de colonne IFT continue (ex: ift_total).")
+if (is.na(col_statut) && is.na(col_patho) && is.na(col_amltyp)) {
+  stop("❌ Cohorte: pas de colonnes pour classifier LAM/CONTROLE (statut/pathologie/aml_type).")
+}
+
+
+# =========================
+# 7) Nettoyage cohorte + groupe + quartiles IFT -> expo_grp
+# =========================
+coh <- coh_raw %>%
+  mutate(
+    code_postal  = pad_cp(.data[[col_cp]]),
+    commune_nom  = if (!is.na(col_com)) str_squish(str_to_upper(as.character(.data[[col_com]]))) else NA_character_,
+    annee_diag   = if (!is.na(col_year)) to_year(.data[[col_year]]) else NA_integer_,
+    
+    statut_clean = if (!is.na(col_statut)) str_to_lower(as.character(.data[[col_statut]])) else NA_character_,
+    patho_clean  = if (!is.na(col_patho))  str_to_lower(as.character(.data[[col_patho]]))  else NA_character_,
+    amltype_clean= if (!is.na(col_amltyp)) str_to_lower(as.character(.data[[col_amltyp]])) else NA_character_,
+    
+    groupe = case_when(
+      !is.na(statut_clean) & str_detect(statut_clean, "cont|temoin|t[eé]moin|control|contr") ~ "CONTROLE",
+      !is.na(statut_clean) & str_detect(statut_clean, "\\bcas\\b|patient") ~ "LAM",
+      !is.na(patho_clean)  & str_detect(patho_clean, "lam|aml") ~ "LAM",
+      !is.na(amltype_clean) & amltype_clean != "" ~ "LAM",
+      TRUE ~ NA_character_
+    ),
+    is_lam = ifelse(groupe == "LAM", 1L, 0L),
+    
+    ift_val = to_num(.data[[col_ift]])
+  ) %>%
+  filter(!is.na(code_postal)) %>%
+  filter(!is.na(groupe)) %>%
+  filter(!is.na(ift_val))
+
+
+if (nrow(coh) == 0) stop("❌ Après nettoyage, la cohorte est vide (statut/pathologie/ift).")
+
+
+qcuts <- suppressWarnings(quantile(coh$ift_val, probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE, type = 7))
+if (length(unique(qcuts)) < 3) stop("❌ Impossible de créer des quartiles IFT (variance trop faible).")
+
+
+coh <- coh %>%
+  mutate(
+    quartile_ift = case_when(
+      ift_val <= qcuts[2] ~ "Q1",
+      ift_val <= qcuts[3] ~ "Q2",
+      ift_val <= qcuts[4] ~ "Q3",
+      TRUE ~ "Q4"
+    ),
+    expo_grp = case_when(
+      quartile_ift %in% c("Q1","Q2") ~ "Q1_Q2",
+      quartile_ift %in% c("Q3","Q4") ~ "Q3_Q4",
+      TRUE ~ NA_character_
+    )
+  )
+
+
+message("\n✔ Effectifs cohorte :"); print(table(coh$groupe))
+message("\n✔ Expo (Q1_Q2 vs Q3_Q4) :"); print(table(coh$expo_grp))
+message("\n✔ Coupes quartiles IFT :"); print(qcuts)
+
+
+# =========================
+# 8) Période (années)
+# =========================
+ok_year <- !is.na(coh$annee_diag) & coh$annee_diag >= 1900 & coh$annee_diag <= 2100
+prop_year <- mean(ok_year)
+if (is.na(prop_year)) prop_year <- 0
+
+
+if (prop_year >= 0.5) {
+  y_min <- min(coh$annee_diag[ok_year], na.rm=TRUE)
+  y_max <- max(coh$annee_diag[ok_year], na.rm=TRUE)
+  nb_years <- y_max - y_min + 1
+  periode_txt <- paste0(y_min, "-", y_max, " (", nb_years, " ans)")
+} else {
+  message("\n⚠️ Année diagnostic insuffisante. Donne la durée de suivi (années).")
+  nb_years <- as.numeric(readline("Durée (années) = "))
+  if (is.na(nb_years) || nb_years <= 0) stop("❌ Durée invalide.")
+  periode_txt <- paste0("durée fournie par l'utilisateur: ", nb_years, " ans")
+}
+message("🕒 Période utilisée : ", periode_txt)
+
+
+# =========================
+# 9) Agrégation cas LAM par expo_grp + CP + commune
+# =========================
+lam_by <- coh %>%
+  group_by(expo_grp, code_postal, commune_nom) %>%
+  summarise(
+    n_LAM = sum(is_lam, na.rm=TRUE),
+    n_total_cohorte = dplyr::n(),
+    .groups="drop"
+  )
+
+
+# =========================
+# 10) Join population (sur code_postal)
+# =========================
+pop <- pop_raw %>%
+  mutate(
+    code_postal = pad_cp(code_postal),
+    population  = to_num(population)
+  ) %>%
+  filter(!is.na(code_postal), !is.na(population), population > 0) %>%
+  select(code_postal, population) %>%
+  distinct()
+
+
+df <- lam_by %>%
+  left_join(pop, by = "code_postal") %>%
+  filter(!is.na(population), population > 0)
+
+
+if (nrow(df) == 0) stop("❌ 0 ligne après jointure population. Vérifie population_commune_cp.csv.")
+
+
+message("✔ Lignes (expo x CP) avec population : ", nrow(df))
+
+
+# =========================
+# 11) Incidence /100k
+# =========================
+df <- df %>%
+  mutate(
+    nb_years = nb_years,
+    incidence_annuelle_100k = (n_LAM / (population * nb_years)) * 100000,
+    incidence_cumulee_100k  = (n_LAM / population) * 100000
+  )
+
+
+# =========================
+# 12) Comparaison (wide + IRR)
+# =========================
+comp <- df %>%
+  select(expo_grp, code_postal, commune_nom, population, n_LAM, incidence_annuelle_100k) %>%
+  tidyr::pivot_wider(
+    names_from = expo_grp,
+    values_from = c(n_LAM, incidence_annuelle_100k),
+    names_sep = "__"
+  ) %>%
+  mutate(
+    irr_Q3Q4_vs_Q1Q2 = incidence_annuelle_100k__Q3_Q4 / incidence_annuelle_100k__Q1_Q2
+  )
+
+
+# =========================
+# 13) QC
+# =========================
+qc <- tibble::tibble(
+  periode = periode_txt,
+  n_lignes = nrow(df),
+  pop_min = min(df$population, na.rm=TRUE),
+  pop_med = median(df$population, na.rm=TRUE),
+  pop_max = max(df$population, na.rm=TRUE),
+  nLAM_total = sum(df$n_LAM, na.rm=TRUE),
+  inc_ann_min = min(df$incidence_annuelle_100k, na.rm=TRUE),
+  inc_ann_med = median(df$incidence_annuelle_100k, na.rm=TRUE),
+  inc_ann_p95 = as.numeric(quantile(df$incidence_annuelle_100k, 0.95, na.rm=TRUE)),
+  inc_ann_max = max(df$incidence_annuelle_100k, na.rm=TRUE)
+)
+
+
+aberrantes <- df %>%
+  arrange(desc(incidence_annuelle_100k)) %>%
+  slice_head(n = 30)
+
+
+df_flag <- df %>%
+  mutate(flag_small_pop = population < 2000)
+
+
+# =========================
+# 14) Export résultats tableaux
+# =========================
+readr::write_csv(pop_raw, file.path(res_dir, "population_commune_cp.csv"))
+readr::write_csv(df_flag, file.path(res_dir, "table_incidence_LAM_par_commune.csv"))
+readr::write_csv(comp, file.path(res_dir, "comparaison_Q1Q2_vs_Q3Q4_par_commune.csv"))
+readr::write_csv(qc, file.path(res_dir, "QC_resume.csv"))
+readr::write_csv(aberrantes, file.path(res_dir, "QC_top30_incidence_annuelle.csv"))
+
+
+# =========================
+# 15) Agrégation globale (Q1_Q2 vs Q3_Q4)
+# =========================
+stopifnot(all(c("expo_grp","n_LAM","population","nb_years") %in% names(df)))
+
+
+agg <- df %>%
+  mutate(expo_grp = ifelse(expo_grp %in% c("Q1","Q2","Q1_Q2"), "Q1_Q2", "Q3_Q4")) %>%
+  group_by(expo_grp) %>%
+  summarise(
+    cases = sum(n_LAM, na.rm=TRUE),
+    py = sum(population * nb_years, na.rm=TRUE),
+    .groups="drop"
+  ) %>%
+  mutate(
+    expo_grp = factor(expo_grp, levels=c("Q1_Q2","Q3_Q4")),
+    rate = cases / py,
+    inc_100k = rate * 100000
+  )
+
+
+# =========================
+# 16) IC95% Poisson exact (incidence)
+# =========================
+poisson_ci <- function(k, py){
+  lo <- if(k==0) 0 else qchisq(0.025, 2*k) / 2
+  hi <- qchisq(0.975, 2*(k+1)) / 2
+  c(lo/py, hi/py)
+}
+ci <- mapply(poisson_ci, agg$cases, agg$py)
+agg$inc_lo_100k <- ci[1,] * 100000
+agg$inc_hi_100k <- ci[2,] * 100000
+
+
+# =========================
+# 17) RR + IC95% + p-value
+# =========================
+a1 <- agg %>% filter(expo_grp=="Q1_Q2")
+a2 <- agg %>% filter(expo_grp=="Q3_Q4")
+
+
+pt <- poisson.test(
+  x = c(a2$cases, a1$cases),
+  T = c(a2$py, a1$py),
+  r = 1
+)
+
+
+RR   <- unname(pt$estimate)
+RRlo <- unname(pt$conf.int[1])
+RRhi <- unname(pt$conf.int[2])
+pval <- pt$p.value
+
+
+p_txt <- formatC(pval, format="e", digits=2)
+p_txt <- gsub("e", " ×10^", p_txt)
+p_txt <- gsub("\\^-(0+)", "^-", p_txt)
+p_txt <- gsub("\\^\\+(0+)", "^",  p_txt)
+
+
+annot <- paste0(
+  "RR ", round(RR,2),
+  " (", round(RRlo,2), "–", round(RRhi,2), ")",
+  "\np=", p_txt
+)
+
+
+# Export résumé global
+resume_global <- agg %>%
+  mutate(
+    RR_vs_ref = c(1, RR),
+    RR_lo = c(NA, RRlo),
+    RR_hi = c(NA, RRhi),
+    p_value = c(NA, pval)
+  )
+
+
+readr::write_csv(resume_global, file.path(res_dir, "resume_global_Q1Q2_vs_Q3Q4.csv"))
+
+
+# =========================
+# 18) Figure
+# =========================
+y_max <- max(agg$inc_hi_100k, na.rm = TRUE)
+y_lim_top <- max(10, ceiling(y_max * 1.15 * 10) / 10)
+
+
+cols <- c("Q1_Q2"="darkgreen", "Q3_Q4"="firebrick")
+
+
+gg <- ggplot(agg, aes(x=expo_grp, y=inc_100k)) +
+  geom_errorbar(aes(ymin=inc_lo_100k, ymax=inc_hi_100k),
+                width=0.15, linewidth=1) +
+  geom_point(aes(color=expo_grp), size=4) +
+  geom_text(
+    data=agg %>% filter(expo_grp=="Q1_Q2"),
+    aes(x=expo_grp, y=inc_100k + 0.05 * y_lim_top),
+    label="Ref.",
+    inherit.aes=FALSE,
+    size=4
+  ) +
+  geom_text(
+    data=agg %>% filter(expo_grp=="Q3_Q4"),
+    aes(x=expo_grp, y=inc_hi_100k + 0.05 * y_lim_top),
+    label=annot,
+    inherit.aes=FALSE,
+    size=4
+  ) +
+  scale_color_manual(values=cols, guide="none") +
+  scale_x_discrete(labels=c(Q1_Q2="Q1–Q2", Q3_Q4="Q3–Q4")) +
+  scale_y_continuous(limits=c(0, y_lim_top)) +
+  labs(
+    title="Incidence de LAM selon l'IFT communal",
+    subtitle="Comparaison Q1–Q2 vs Q3–Q4 ; points = incidence annuelle (/100 000/an) ; barres = IC95% Poisson ; RR vs Q1–Q2",
+    x=NULL,
+    y="Incidence annuelle LAM (/100 000/an)"
+  ) +
+  theme_classic(base_size=13)
+
+
+print(gg)
+
+
+ggsave(
+  file.path(res_dir, "figure_Q1Q2_vs_Q3Q4.png"),
+  gg, width=10, height=6, dpi=150
+)
+message("✅ Figure enregistrée : ", file.path(res_dir, "figure_Q1Q2_vs_Q3Q4.png"))
+
+
+# =========================
+# 19) Fin
+# =========================
+message("\n✅ Terminé.")
+message("📁 Dossier résultats : ", res_dir)
+message("📄 POP : population_commune_cp.csv")
+message("📄 Table (long) : table_incidence_LAM_par_commune.csv (expo_grp = Q1_Q2 / Q3_Q4)")
+message("📄 Comparaison : comparaison_Q1Q2_vs_Q3Q4_par_commune.csv (IRR)")
+message("📄 Résumé global : resume_global_Q1Q2_vs_Q3Q4.csv")
+message("📄 QC : QC_resume.csv + QC_top30_incidence_annuelle.csv")
+message("📄 Figure : figure_Q1Q2_vs_Q3Q4.png")
+message("\nℹ️ Variable expo utilisée (quartiles) : ", col_ift)
