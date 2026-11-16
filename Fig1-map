@@ -1,0 +1,22 @@
+rm(list=ls())
+library(sf)
+library(ggplot2)
+library(dplyr)
+map<-st_read("C:/Users/picou/Desktop/Amelie 2025 GEOAML/Raw data/codes_postaux_V5/codes_postaux_region.shp")
+res<-res<-read.csv2("C:/Users/picou/Desktop/Amelie 2025 GEOAML/04032025/RD.csv")
+resI<-read.csv2("C:/Users/picou/Desktop/table_incidence_LAM_par_commune.csv")
+
+pest<-as.data.frame(cbind(resI$code_postal, resI$incidence_cumulee_100k))
+pest[,2]<-as.numeric(pest[,2])
+
+
+map_data<- map %>%
+  left_join(pest, by = c("ID"="V1"))
+
+ggplot(map_data) +
+  geom_sf(aes(fill=V2))+
+  scale_fill_viridis_c( option = "magma", na.value="lightgrey")+
+  theme_minimal()
++theme(panel.grid = element_blank(),
+       axis.test=element_blank())
+
